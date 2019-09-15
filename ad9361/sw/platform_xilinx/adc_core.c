@@ -47,16 +47,36 @@
 #include "adc_core.h"
 #include "parameters.h"
 #include "util.h"
+#include "config.h"
+#ifdef ADC_DMA_IRQ_EXAMPLE
+#ifdef _XPARAMETERS_PS_H_
+#include <xscugic.h>
+#elif defined _MICROBLAZE_INTERFACE_H_
+#include <xintc.h>
+#endif
+#endif
 
 /******************************************************************************/
 /********************** Macros and Constants Definitions **********************/
 /******************************************************************************/
-//#define FMCOMMS5
+#ifdef ADC_DMA_IRQ_EXAMPLE
+#ifdef _XPARAMETERS_PS_H_
+#define ADC_DMA_INT_ID			89
+#elif defined _MICROBLAZE_INTERFACE_H_
+#define ADC_DMA_INT_ID			12
+#endif
+#define ADC_DMA_TRANSFER_SIZE	32768
+#endif
 
 /******************************************************************************/
 /************************ Variables Definitions *******************************/
 /******************************************************************************/
 struct adc_state adc_st;
+#ifdef ADC_DMA_IRQ_EXAMPLE
+uint8_t  dma_transfer_queued_flag		= 0;
+uint8_t  dma_transfer_completed_flag	= 0;
+uint32_t dma_start_address				= 0;
+#endif
 
 /***************************************************************************//**
  * @brief adc_read
@@ -137,6 +157,31 @@ void adc_init(struct ad9361_rf_phy *phy)
 	}
 }
 
+#ifdef ADC_DMA_IRQ_EXAMPLE
+/***************************************************************************//**
+ * @brief adc_dma_isr
+*******************************************************************************/
+void adc_dma_isr(void *instance)
+{
+	uint32_t reg_val;
+
+	adc_dma_read(AXI_DMAC_REG_IRQ_PENDING, &reg_val);
+	adc_dma_write(AXI_DMAC_REG_IRQ_PENDING, reg_val);
+	if(reg_val & IRQ_TRANSFER_QUEUED)
+	{
+		dma_transfer_queued_flag = 1;
+		dma_start_address += ADC_DMA_TRANSFER_SIZE;
+		adc_dma_write(AXI_DMAC_REG_DEST_ADDRESS, dma_start_address);
+		/* The current transfer was started and a new one is queued. */
+		adc_dma_write(AXI_DMAC_REG_START_TRANSFER, 0x1);
+	}
+	if(reg_val & IRQ_TRANSFER_COMPLETED)
+	{
+		dma_transfer_completed_flag = 1;
+	}
+}
+#endif
+
 /***************************************************************************//**
  * @brief adc_capture
 *******************************************************************************/
@@ -168,6 +213,73 @@ int32_t adc_capture(uint32_t size, uint32_t start_address)
 	adc_dma_read(AXI_DMAC_REG_IRQ_PENDING, &reg_val);
 	adc_dma_write(AXI_DMAC_REG_IRQ_PENDING, reg_val);
 
+#ifdef ADC_DMA_IRQ_EXAMPLE
+#ifdef _XPARAMETERS_PS_H_
+	XScuGic_Config	*gic_config;
+	XScuGic			gic;
+	int32_t			status;
+
+	gic_config = XScuGic_LookupConfig(XPAR_PS7_SCUGIC_0_DEVICE_ID);
+	if(gic_config == NULL)
+		printf("XScuGic_LookupConfig Error\n");
+
+	status = XScuGic_CfgInitialize(&gic,
+			gic_config, gic_config->CpuBaseAddress);
+	if(status)
+		printf("XScuGic_CfgInitialize Error\n");
+
+	XScuGic_SetPriorityTriggerType(&gic, ADC_DMA_INT_ID, 0x0, 0x3);
+
+	status = XScuGic_Connect(&gic,
+			ADC_DMA_INT_ID, (Xil_ExceptionHandler)adc_dma_isr, NULL);
+	if(status)
+		printf("XScuGic_Connect Error\n");
+
+	XScuGic_Enable(&gic, ADC_DMA_INT_ID);
+
+	Xil_ExceptionInit();
+
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
+			(Xil_ExceptionHandler)XScuGic_InterruptHandler, (void *)&gic);
+	Xil_ExceptionEnable();
+#elif defined _MICROBLAZE_INTERFACE_H_
+	XIntc	intc;
+	int32_t	status;
+
+	status = XIntc_Initialize(&intc, XPAR_AXI_INTC_DEVICE_ID);
+	if(status)
+		printf("XIntc_Initialize Error\n");
+
+	status = XIntc_Connect(&intc, ADC_DMA_INT_ID,
+			(Xil_ExceptionHandler)adc_dma_isr, NULL);
+	if(status)
+		printf("XIntc_Connect Error\n");
+
+	XIntc_Enable(&intc, ADC_DMA_INT_ID);
+
+	status = XIntc_Start(&intc, XIN_REAL_MODE);
+	if(status)
+		printf("XIntc_Start Error\n");
+
+	Xil_ExceptionInit();
+
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
+			(Xil_ExceptionHandler)XIntc_InterruptHandler, (void *)&intc);
+	Xil_ExceptionEnable();
+#endif
+
+	dma_start_address = start_address;
+
+	adc_dma_write(AXI_DMAC_REG_DEST_ADDRESS, dma_start_address);
+	adc_dma_write(AXI_DMAC_REG_DEST_STRIDE, 0x0);
+	adc_dma_write(AXI_DMAC_REG_X_LENGTH, ADC_DMA_TRANSFER_SIZE - 1);
+	adc_dma_write(AXI_DMAC_REG_Y_LENGTH, 0x0);
+
+	adc_dma_write(AXI_DMAC_REG_START_TRANSFER, 0x1);
+
+	while(dma_start_address < (start_address + length + ADC_DMA_TRANSFER_SIZE));
+	adc_dma_write(ADC_REG_DMA_CNTRL, 0x0);
+#else
 	adc_dma_write(AXI_DMAC_REG_DEST_ADDRESS, start_address);
 	adc_dma_write(AXI_DMAC_REG_DEST_STRIDE, 0x0);
 	adc_dma_write(AXI_DMAC_REG_X_LENGTH, length - 1);
@@ -184,7 +296,7 @@ int32_t adc_capture(uint32_t size, uint32_t start_address)
 	do {
 		adc_dma_read(AXI_DMAC_REG_IRQ_PENDING, &reg_val);
 	}
-	while(reg_val != (AXI_DMAC_IRQ_SOT | AXI_DMAC_IRQ_EOT));
+	while(reg_val != (IRQ_TRANSFER_QUEUED | IRQ_TRANSFER_COMPLETED));
 	adc_dma_write(AXI_DMAC_REG_IRQ_PENDING, reg_val);
 
 	/* Wait until the transfer with the ID transfer_id is completed. */
@@ -192,7 +304,7 @@ int32_t adc_capture(uint32_t size, uint32_t start_address)
 		adc_dma_read(AXI_DMAC_REG_TRANSFER_DONE, &reg_val);
 	}
 	while((reg_val & (1 << transfer_id)) != (1 << transfer_id));
-
+#endif
 	return 0;
 }
 
